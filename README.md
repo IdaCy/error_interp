@@ -3,12 +3,12 @@
 This is a research project by IMI (Imperial Mechanistic Interpretability) exploring how Large Language Models (LLMs) process and respond to *semantically equivalent* instructions or questions that differ in style, tone, or structure. 
 
 The repository focuses on:
-- **Paraphrased Prompt Generation** (e.g. polite vs. urgent rephrasings)
+- **Typo Prompt Generation** (e.g. polite vs. urgent rephrasings)
 - **Mechanistic Interpretability** (internal attention and neuron activation differences)
 - **Evaluation Metrics** (using open-source reward models or GPT-4 to score responses)
 - **Analysis** of .pt files containing hidden states, attentions, and outputs
 
-This work aims to shed light on how LLMs encode paraphrased queries and to measure the reliability of their output under varied phrasing.
+This work aims to shed light on how LLMs encode typo-introduced queries and to measure the reliability of their output under varied phrasing.
 
 ---
 
@@ -29,9 +29,9 @@ This work aims to shed light on how LLMs encode paraphrased queries and to measu
 
 Modern LLMs can perform differently even if two prompts share the same meaning but differ in wording. This repository investigates that phenomenon by:
 
-- **Generating** paraphrased prompts (e.g. “polite,” “urgent,” etc.).
+- **Generating** typo prompts (e.g. "main” word changed, “swap,” etc.).
 - **Running inference** on an LLM to capture hidden representations (attention weights, embeddings).
-- **Scoring** the generated outputs using a reward model (like [OpenAssistant’s DeBERTa-based RM](https://huggingface.co/OpenAssistant/reward-model-deberta-v3-large-v2)) to gauge performance differences among paraphrases.
+- **Scoring** the generated outputs using a reward model (like [OpenAssistant’s DeBERTa-based RM](https://huggingface.co/OpenAssistant/reward-model-deberta-v3-large-v2)) to gauge performance differences among typo strings.
 - **Analyzing** internal activations to identify which layers/heads are sensitive to style or wording changes.
 
 ---
@@ -40,8 +40,8 @@ Modern LLMs can perform differently even if two prompts share the same meaning b
 
 1. Clone the repository:
    ```
-   git clone https://github.com/IdaCy/ParaphrX.git
-   cd ParaphrX
+   git clone https://github.com/IdaCy/error_interp.git
+   cd error_interp
    ```
 
 2. Create (and activate) a virtual environment (optional, but recommended):
@@ -72,7 +72,7 @@ Modern LLMs can perform differently even if two prompts share the same meaning b
 **Scripts**:
 - [`inference.py`](./inference.py) or the provided code snippet that:
   1. Loads a pre-trained LLM (e.g. `google/gemma-2-9b-it`).
-  2. Reads a JSON of user prompts (or paraphrases).
+  2. Reads a JSON of user prompts (or typo versions).
   3. Runs inference in batches, capturing hidden states, attentions, top-k logits, final predictions, etc.
   4. Saves them to `.pt` files in an output directory.
 
@@ -84,7 +84,7 @@ python inference.py \
   --output_dir outputs/polite_run
 ```
 
-You can do this for each paraphrase style (e.g. “urgent,” “polite,” etc.) to produce multiple `.pt` files containing your model’s outputs.
+You can do this for each typo style (e.g. “main,” word changed “swap,” in charecters etc.) to produce multiple `.pt` files containing your model’s outputs.
 
 ### Scoring and Evaluation
 
@@ -132,9 +132,9 @@ else:
 
 ## Data
 
-You’ll need to provide your own paraphrased prompt data. Some typical workflows:
-- Generate paraphrases with a strong LLM (like GPT-4).
-- Use *existing* paraphrase datasets (Quora, PAWS, etc.) and adapt them into an instruction style.
+You’ll need to provide your own typo-introduced prompt data. Some typical workflows:
+- Generate typo version with a strong LLM (like GPT-4).
+- Use *existing* datasets (Quora, PAWS, etc.) and adapt them into an instruction style.
 
 **Example**:
 ```
@@ -153,7 +153,7 @@ You’ll need to provide your own paraphrased prompt data. Some typical workflow
 Structure initially:
 
 ```
-ParaphrX/
+error_interp/
 ├── 0_data/
 │   ├── maths.json         <- put your JSON here
 │   └── instructions.json
@@ -195,7 +195,7 @@ ParaphrX/
 1. **Fork** the repository.
 2. **Create a branch** for your feature/patch.
 3. **Submit a Pull Request** describing changes and test results.
-4. For major contributions or architectural changes, please open an [Issue](https://github.com/IdaCy/ParaphrX/issues) first.
+4. For major contributions or architectural changes, please open an [Issue](https://github.com/IdaCy/error_interp/issues) first.
 
 We welcome feedback, bug reports, and discussion!
 
