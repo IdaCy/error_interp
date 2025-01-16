@@ -1,4 +1,4 @@
-# ParaphrX
+# Error Mech Analysis
 
 This is a research project by IMI (Imperial Mechanistic Interpretability) exploring how Large Language Models (LLMs) process and respond to *semantically equivalent* instructions or questions that differ in style, tone, or structure. 
 
