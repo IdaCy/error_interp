@@ -1,6 +1,7 @@
 [
     {
         "element_index": 1,
+        "normal": "Solve this task: 4 + 93 =",
         "main": "Solve this tasck: 4 + 93 =",
         "swap": "Solve this taks: 4 + 93 =",
         "missing": "Solve this tsk: 4 + 93 =",
