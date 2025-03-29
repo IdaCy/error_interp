@@ -13,6 +13,7 @@ DEFAULT_BATCH_SIZE = 4
 DEFAULT_MAX_SEQ_LENGTH = 2048
 DEFAULT_TOP_K_LOGITS = 10
 DEFAULT_NUM_LAYERS = 26  # total number of layers in the model
+DEFAULT_OUT_NAME = "patch_result"
 
 DEFAULT_GENERATION_KWARGS = {
     "do_sample": True,
@@ -71,6 +72,7 @@ def run_inf_main_patched(model,
                          patch_scale=1.0,
                          patch_layers=None,
                          output_dir=DEFAULT_OUTPUT_DIR,
+                         out_name=DEFAULT_OUT_NAME,
                          batch_size=DEFAULT_BATCH_SIZE,
                          max_seq_length=DEFAULT_MAX_SEQ_LENGTH,
                          top_k_logits=DEFAULT_TOP_K_LOGITS,
@@ -192,7 +194,8 @@ def run_inf_main_patched(model,
             })
 
     # Instead of saving a list, wrap the results in a dictionary so evaluate_predictions can read it.
-    save_name = "patched_main_results.pt"
+    save_name = out_name + ".pt"
+    #save_name = "patched_main_results.pt"
     save_path = os.path.join(output_dir, save_name)
     torch.save({
         "final_predictions": [r["final_prediction"] for r in results],
@@ -239,6 +242,7 @@ if __name__ == "__main__":
         patch_scale=args.patch_scale,
         patch_layers=patch_layers,
         output_dir=args.output_dir,
+        out_name=args.out_name,
         batch_size=args.batch_size,
         max_seq_length=args.max_seq_length,
         top_k_logits=args.top_k_logits,
