@@ -83,7 +83,7 @@ def run_inf_main_patched(model,
     # If no specific layers are provided, patch all layers.
     if patch_layers is None:
         patch_layers = list(range(DEFAULT_NUM_LAYERS))
-    # Also use these layers for extraction (patching) if not provided
+    # Also use these layers for extraction if not provided
     if extract_attention_layers is None:
         extract_attention_layers = patch_layers
 
@@ -94,6 +94,9 @@ def run_inf_main_patched(model,
 
     if generation_kwargs is None:
         generation_kwargs = DEFAULT_GENERATION_KWARGS
+
+    # Set the model's config to output attentions (if not already set)
+    model.config.output_attentions = True
 
     # We'll use a set for quick lookup of which layers to patch.
     attention_patch_layers = set(patch_layers)
@@ -132,10 +135,10 @@ def run_inf_main_patched(model,
             # Define a patched forward for a single sample.
             original_forward_inner = model.forward
             def single_sample_patched_forward(input_ids=None, attention_mask=None, **kwargs):
+                # Remove explicit output_attentions argument (since model.config is already set)
                 raw_outputs = original_forward_inner(
                     input_ids=input_ids,
                     attention_mask=attention_mask,
-                    output_attentions=True,
                     **kwargs
                 )
                 new_attns = []
@@ -170,8 +173,7 @@ def run_inf_main_patched(model,
             with torch.no_grad():
                 outputs = model(
                     input_ids=single_input_ids,
-                    attention_mask=single_attn_mask,
-                    output_attentions=True
+                    attention_mask=single_attn_mask
                 )
                 gen_out = model.generate(
                     single_input_ids,
@@ -190,7 +192,7 @@ def run_inf_main_patched(model,
                 "attentions": [a.cpu() for a in outputs.attentions],
             })
 
-    # Save all results in one file per batch (or adjust as needed)
+    # Save all results in one file (you can modify this to save per batch if desired)
     save_name = "patched_main_results.pt"
     save_path = os.path.join(output_dir, save_name)
     torch.save(results, save_path)
@@ -227,7 +229,7 @@ if __name__ == "__main__":
 
     model, tokenizer = load_model(logger=logger)
     
-    # Load the normal attention from Script A.
+    # Load the normal attention from the specified directory.
     normal_attn_map_all = load_normal_attention(args.normal_attention_dir, logger=logger)
 
     run_inf_main_patched(
