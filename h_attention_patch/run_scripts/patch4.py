@@ -42,7 +42,6 @@ def load_normal_attention(normal_attention_dir, logger=None):
             sample_idx = indices[idx]
             single_sample_map = {}
             for layer_key, layer_tensor in attn_map.items():
-                # layer_tensor shape: [batch_size, num_heads, seq_len, seq_len]
                 single_sample_map[layer_key] = layer_tensor[idx]  # shape: [num_heads, seq_len, seq_len]
             normal_attn_map_all[sample_idx] = single_sample_map
             logger.debug(f"Saved normal attention for sample {sample_idx}")
@@ -96,7 +95,6 @@ def run_inf_main_patched(model,
         generation_kwargs = DEFAULT_GENERATION_KWARGS
     model.config.output_attentions = True
 
-    # Use a set for quick lookup.
     attention_patch_layers = set(patch_layers)
     total_samples = len(data)
     total_batches = math.ceil(total_samples / batch_size)
@@ -133,7 +131,6 @@ def run_inf_main_patched(model,
             )
             new_attns = []
             B = input_ids.shape[0]
-            # For each layer, if patching is required, patch each sample in the batch.
             for layer_idx, attn_tensor in enumerate(raw_outputs.attentions):
                 if layer_idx in attention_patch_layers:
                     layer_key = f"layer_{layer_idx}"
@@ -142,7 +139,6 @@ def run_inf_main_patched(model,
                         sample_idx = batch_indices[j]
                         if sample_idx in normal_attn_map_all and layer_key in normal_attn_map_all[sample_idx]:
                             normal_attn = normal_attn_map_all[sample_idx][layer_key].to(attn_tensor.device)
-                            # attn_tensor[j:j+1] shape: [1, num_heads, seq_len, seq_len]
                             patched = patch_attention(attn_tensor[j:j+1], normal_attn.unsqueeze(0), scale=patch_scale)
                             patched_list.append(patched)
                             logger.debug(f"Patched layer {layer_idx} for sample {sample_idx}")
@@ -177,13 +173,10 @@ def run_inf_main_patched(model,
             )
         model.forward = original_forward_inner
 
-        # Decode predictions for the batch.
         decoded_preds = [tokenizer.decode(o, skip_special_tokens=True) for o in gen_out.cpu()]
         logger.debug(f"Batch {batch_idx+1} predictions: {decoded_preds}")
 
-        # Save results per sample.
         for j, sample_idx in enumerate(batch_indices):
-            # Extract the j-th sample's attention for each layer.
             sample_attns = [a[j].cpu() for a in outputs.attentions]
             results.append({
                 "sample_idx": sample_idx,
@@ -191,9 +184,14 @@ def run_inf_main_patched(model,
                 "attentions": sample_attns,
             })
 
+    # Instead of saving a list, wrap the results in a dictionary so evaluate_predictions can read it.
     save_name = "patched_main_results.pt"
     save_path = os.path.join(output_dir, save_name)
-    torch.save(results, save_path)
+    torch.save({
+        "final_predictions": [r["final_prediction"] for r in results],
+        "attentions": [r["attentions"] for r in results],
+        "original_indices": [r["sample_idx"] for r in results]
+    }, save_path)
     logger.debug(f"[Typo Patch] Saved patched results => {save_path}")
     logger.warning("=== Main (typo) patched Inference Complete ===")
 
