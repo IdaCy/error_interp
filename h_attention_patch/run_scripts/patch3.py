@@ -29,7 +29,6 @@ def load_normal_attention(normal_attention_dir, logger=None):
     """
     if logger is None:
         logger = logging.getLogger()
-
     normal_attn_map_all = {}
     for fname in os.listdir(normal_attention_dir):
         if not fname.endswith(".pt"):
@@ -39,7 +38,6 @@ def load_normal_attention(normal_attention_dir, logger=None):
         saved_dict = torch.load(fpath, map_location="cpu")
         indices = saved_dict["original_indices"]
         attn_map = saved_dict["attentions"]
-        # Save each attention map in a dictionary
         for idx in range(len(indices)):
             sample_idx = indices[idx]
             single_sample_map = {}
@@ -47,6 +45,7 @@ def load_normal_attention(normal_attention_dir, logger=None):
                 # layer_tensor shape: [batch_size, num_heads, seq_len, seq_len]
                 single_sample_map[layer_key] = layer_tensor[idx]  # shape: [num_heads, seq_len, seq_len]
             normal_attn_map_all[sample_idx] = single_sample_map
+            logger.debug(f"Saved normal attention for sample {sample_idx}")
     return normal_attn_map_all
 
 def patch_attention(current_attention, normal_attention, scale=1.0):
@@ -74,38 +73,36 @@ def run_inf_main_patched(model,
                          extract_attention_layers=None):
     """
     Runs inference on 'main' (typo) data while patching the attention using the saved normal attention.
-    - patch_scale: a float in [0.0, 1.0] controlling how much normal attention is used.
-    - patch_layers: list of layer indices to patch; if None, defaults to all layers.
+    
+    Tunable parameters:
+      - batch_size: Number of samples to process per batch.
+      - patch_layers: Which layers to patch (e.g., all layers, or a subset).
+      - patch_scale: How much normal attention to use (1.0 means full replacement).
+      - max_seq_length: Maximum token length; lower if your prompts are short.
+    
+    This version processes each batch as a whole rather than patching one sample at a time.
     """
     if logger is None:
         logger = logging.getLogger("polAIlogger")
-
-    # If no specific layers are provided, patch all layers.
     if patch_layers is None:
         patch_layers = list(range(DEFAULT_NUM_LAYERS))
-    # Also use these layers for extraction if not provided
     if extract_attention_layers is None:
         extract_attention_layers = patch_layers
 
     os.makedirs(output_dir, exist_ok=True)
-
     logger.info("Clearing CUDA cache before starting (typo patch).")
     torch.cuda.empty_cache()
-
     if generation_kwargs is None:
         generation_kwargs = DEFAULT_GENERATION_KWARGS
-
-    # Set the model's config to output attentions (if not already set)
     model.config.output_attentions = True
 
-    # We'll use a set for quick lookup of which layers to patch.
+    # Use a set for quick lookup.
     attention_patch_layers = set(patch_layers)
-
     total_samples = len(data)
     total_batches = math.ceil(total_samples / batch_size)
     logger.warning(f"=== Starting MAIN (typo) inference with patched attention. #samples={total_samples} ===")
+    logger.debug(f"Batch size: {batch_size}, Total batches: {total_batches}")
 
-    # Process samples one by one to allow per-sample patching.
     results = []
     for batch_idx in range(total_batches):
         start_i = batch_idx * batch_size
@@ -113,9 +110,8 @@ def run_inf_main_patched(model,
         batch_items = data[start_i:end_i]
         batch_indices = [x[0] for x in batch_items]
         batch_texts = [x[1] for x in batch_items]
-
-        if batch_idx % 20 == 0:
-            logger.info(f"[Typo Patch] Processing batch {batch_idx+1}/{total_batches} (samples {start_i}-{end_i-1})")
+        logger.info(f"[Typo Patch] Processing batch {batch_idx+1}/{total_batches} (samples {start_i}-{end_i-1})")
+        logger.debug(f"Batch indices: {batch_indices}")
 
         encodings = tokenizer(
             batch_texts,
@@ -127,72 +123,74 @@ def run_inf_main_patched(model,
         input_ids = encodings["input_ids"].cuda()
         attention_mask = encodings["attention_mask"].cuda()
 
-        # For simplicity, we perform a single-sample forward pass for each sample in the batch.
-        for i, sample_idx in enumerate(batch_indices):
-            single_input_ids = input_ids[i].unsqueeze(0)
-            single_attn_mask = attention_mask[i].unsqueeze(0)
-
-            # Define a patched forward for a single sample.
-            original_forward_inner = model.forward
-            def single_sample_patched_forward(input_ids=None, attention_mask=None, **kwargs):
-                # Remove explicit output_attentions argument (since model.config is already set)
-                raw_outputs = original_forward_inner(
-                    input_ids=input_ids,
-                    attention_mask=attention_mask,
-                    **kwargs
-                )
-                new_attns = []
-                # Use the saved normal attention if available for this sample.
-                if sample_idx in normal_attn_map_all:
-                    normal_sample_map = normal_attn_map_all[sample_idx]  # dict: layer_key -> tensor
-                else:
-                    normal_sample_map = {}
-                for layer_idx, attn_tensor in enumerate(raw_outputs.attentions):
-                    # attn_tensor shape: [1, num_heads, seq_len, seq_len]
-                    if layer_idx in attention_patch_layers:
-                        layer_key = f"layer_{layer_idx}"
-                        if layer_key in normal_sample_map:
-                            normal_attn = normal_sample_map[layer_key].to(attn_tensor.device)
-                            patched_layer = patch_attention(attn_tensor, normal_attn, scale=patch_scale)
-                            new_attns.append(patched_layer)
+        # Define a patched forward function that works on the entire batch.
+        original_forward_inner = model.forward
+        def batch_sample_patched_forward(input_ids=None, attention_mask=None, **kwargs):
+            raw_outputs = original_forward_inner(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                **kwargs
+            )
+            new_attns = []
+            B = input_ids.shape[0]
+            # For each layer, if patching is required, patch each sample in the batch.
+            for layer_idx, attn_tensor in enumerate(raw_outputs.attentions):
+                if layer_idx in attention_patch_layers:
+                    layer_key = f"layer_{layer_idx}"
+                    patched_list = []
+                    for j in range(B):
+                        sample_idx = batch_indices[j]
+                        if sample_idx in normal_attn_map_all and layer_key in normal_attn_map_all[sample_idx]:
+                            normal_attn = normal_attn_map_all[sample_idx][layer_key].to(attn_tensor.device)
+                            # attn_tensor[j:j+1] shape: [1, num_heads, seq_len, seq_len]
+                            patched = patch_attention(attn_tensor[j:j+1], normal_attn.unsqueeze(0), scale=patch_scale)
+                            patched_list.append(patched)
+                            logger.debug(f"Patched layer {layer_idx} for sample {sample_idx}")
                         else:
-                            new_attns.append(attn_tensor)
-                    else:
-                        new_attns.append(attn_tensor)
-                # Reconstruct the output with patched attentions.
-                final_output = raw_outputs.__class__(
-                    loss=raw_outputs.loss,
-                    logits=raw_outputs.logits,
-                    past_key_values=raw_outputs.past_key_values,
-                    hidden_states=raw_outputs.hidden_states,
-                    attentions=tuple(new_attns),
-                )
-                return final_output
+                            patched_list.append(attn_tensor[j:j+1])
+                            logger.debug(f"No normal attention for layer {layer_idx} of sample {sample_idx}")
+                    patched_layer_batch = torch.cat(patched_list, dim=0)
+                    new_attns.append(patched_layer_batch)
+                else:
+                    new_attns.append(attn_tensor)
+            final_output = raw_outputs.__class__(
+                loss=raw_outputs.loss,
+                logits=raw_outputs.logits,
+                past_key_values=raw_outputs.past_key_values,
+                hidden_states=raw_outputs.hidden_states,
+                attentions=tuple(new_attns),
+            )
+            return final_output
 
-            model.forward = single_sample_patched_forward
-            with torch.no_grad():
-                outputs = model(
-                    input_ids=single_input_ids,
-                    attention_mask=single_attn_mask
-                )
-                gen_out = model.generate(
-                    single_input_ids,
-                    attention_mask=single_attn_mask,
-                    pad_token_id=tokenizer.pad_token_id,
-                    eos_token_id=tokenizer.eos_token_id,
-                    **generation_kwargs
-                )
-            # Restore original forward.
-            model.forward = original_forward_inner
+        model.forward = batch_sample_patched_forward
+        with torch.no_grad():
+            outputs = model(
+                input_ids=input_ids,
+                attention_mask=attention_mask
+            )
+            gen_out = model.generate(
+                input_ids,
+                attention_mask=attention_mask,
+                pad_token_id=tokenizer.pad_token_id,
+                eos_token_id=tokenizer.eos_token_id,
+                **generation_kwargs
+            )
+        model.forward = original_forward_inner
 
-            decoded_pred = tokenizer.decode(gen_out[0].cpu(), skip_special_tokens=True)
+        # Decode predictions for the batch.
+        decoded_preds = [tokenizer.decode(o, skip_special_tokens=True) for o in gen_out.cpu()]
+        logger.debug(f"Batch {batch_idx+1} predictions: {decoded_preds}")
+
+        # Save results per sample.
+        for j, sample_idx in enumerate(batch_indices):
+            # Extract the j-th sample's attention for each layer.
+            sample_attns = [a[j].cpu() for a in outputs.attentions]
             results.append({
                 "sample_idx": sample_idx,
-                "final_prediction": decoded_pred,
-                "attentions": [a.cpu() for a in outputs.attentions],
+                "final_prediction": decoded_preds[j],
+                "attentions": sample_attns,
             })
 
-    # Save all results in one file (you can modify this to save per batch if desired)
     save_name = "patched_main_results.pt"
     save_path = os.path.join(output_dir, save_name)
     torch.save(results, save_path)
@@ -217,19 +215,15 @@ if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
     logger = logging.getLogger("polAIlogger")
 
-    # Process patch_layers argument.
     if args.patch_layers.lower() == "all":
         patch_layers = list(range(DEFAULT_NUM_LAYERS))
     else:
-        # Parse comma-separated list into integers.
         patch_layers = [int(x.strip()) for x in args.patch_layers.split(",")]
 
     # EXAMPLE: dummy data (typo version)
     dummy_data = [(i, f"Solve this tasck: 4 + 93 = ??? [Typo version {i}]") for i in range(10)]
 
     model, tokenizer = load_model(logger=logger)
-    
-    # Load the normal attention from the specified directory.
     normal_attn_map_all = load_normal_attention(args.normal_attention_dir, logger=logger)
 
     run_inf_main_patched(
