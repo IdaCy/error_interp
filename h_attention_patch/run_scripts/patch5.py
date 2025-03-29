@@ -52,9 +52,16 @@ def patch_attention(current_attention, normal_attention, scale=1.0):
     Blends the current (typo) attention with the normal one.
       - scale=1.0 => fully replace with normal
       - scale=0.5 => average them, etc.
-    Both inputs should have the same shape.
+    If the two attention maps have different sequence lengths,
+    they are cropped to the minimum sequence length along both dimensions.
+    Both inputs should be tensors of shape [1, num_heads, seq_len, seq_len].
     """
-    patched = (1.0 - scale) * current_attention + scale * normal_attention
+    seq_len_current = current_attention.size(-1)
+    seq_len_normal = normal_attention.size(-1)
+    min_seq_len = min(seq_len_current, seq_len_normal)
+    current_cropped = current_attention[..., :min_seq_len, :min_seq_len]
+    normal_cropped = normal_attention[..., :min_seq_len, :min_seq_len]
+    patched = (1.0 - scale) * current_cropped + scale * normal_cropped
     return patched
 
 def run_inf_main_patched(model,
