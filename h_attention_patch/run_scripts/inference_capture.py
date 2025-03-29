@@ -8,7 +8,7 @@ from transformers import AutoTokenizer, AutoModelForCausalLM
 from b_utils.run_scripts.load_model import load_model
 
 # Default parameters
-DEFAULT_OUTPUT_DIR = "output_normal/"
+DEFAULT_OUTPUT_DIR = "output_main_patched/"
 DEFAULT_BATCH_SIZE = 4
 DEFAULT_MAX_SEQ_LENGTH = 2048
 DEFAULT_TOP_K_LOGITS = 10
@@ -22,39 +22,91 @@ DEFAULT_GENERATION_KWARGS = {
     "repetition_penalty": 1.2
 }
 
-def run_inf_normal_capture(model,
-                           tokenizer,
-                           data,
-                           output_dir=DEFAULT_OUTPUT_DIR,
-                           batch_size=DEFAULT_BATCH_SIZE,
-                           max_seq_length=DEFAULT_MAX_SEQ_LENGTH,
-                           extract_attention_layers=None,
-                           top_k_logits=DEFAULT_TOP_K_LOGITS,
-                           logger=None,
-                           generation_kwargs=None):
+def load_normal_attention(normal_attention_dir, logger=None):
     """
-    Runs inference on 'normal' data and captures the full attention maps (all layers)
-    for later use in patching.
+    Loads all saved normal attention .pt files from a directory into a dictionary.
+    Each sample is keyed by its original index.
+    """
+    if logger is None:
+        logger = logging.getLogger()
+
+    normal_attn_map_all = {}
+    for fname in os.listdir(normal_attention_dir):
+        if not fname.endswith(".pt"):
+            continue
+        fpath = os.path.join(normal_attention_dir, fname)
+        logger.info(f"Loading normal attention from {fpath} ...")
+        saved_dict = torch.load(fpath, map_location="cpu")
+        indices = saved_dict["original_indices"]
+        attn_map = saved_dict["attentions"]
+        # Save each attention map in a dictionary
+        for idx in range(len(indices)):
+            sample_idx = indices[idx]
+            single_sample_map = {}
+            for layer_key, layer_tensor in attn_map.items():
+                # layer_tensor shape: [batch_size, num_heads, seq_len, seq_len]
+                single_sample_map[layer_key] = layer_tensor[idx]  # shape: [num_heads, seq_len, seq_len]
+            normal_attn_map_all[sample_idx] = single_sample_map
+    return normal_attn_map_all
+
+def patch_attention(current_attention, normal_attention, scale=1.0):
+    """
+    Blends the current (typo) attention with the normal one.
+      - scale=1.0 => fully replace with normal
+      - scale=0.5 => average them, etc.
+    Both inputs should have the same shape.
+    """
+    patched = (1.0 - scale) * current_attention + scale * normal_attention
+    return patched
+
+def run_inf_main_patched(model,
+                         tokenizer,
+                         data,
+                         normal_attn_map_all,
+                         patch_scale=1.0,
+                         patch_layers=None,
+                         output_dir=DEFAULT_OUTPUT_DIR,
+                         batch_size=DEFAULT_BATCH_SIZE,
+                         max_seq_length=DEFAULT_MAX_SEQ_LENGTH,
+                         top_k_logits=DEFAULT_TOP_K_LOGITS,
+                         logger=None,
+                         generation_kwargs=None,
+                         extract_attention_layers=None):
+    """
+    Runs inference on 'main' (typo) data while patching the attention using the saved normal attention.
+    - patch_scale: a float in [0.0, 1.0] controlling how much normal attention is used.
+    - patch_layers: list of layer indices to patch; if None, defaults to all layers.
     """
     if logger is None:
         logger = logging.getLogger("polAIlogger")
 
-    # If not provided, capture attention from every layer:
+    # If no specific layers are provided, patch all layers.
+    if patch_layers is None:
+        patch_layers = list(range(DEFAULT_NUM_LAYERS))
+    # Also use these layers for extraction (patching) if not provided
     if extract_attention_layers is None:
-        extract_attention_layers = list(range(DEFAULT_NUM_LAYERS))
+        extract_attention_layers = patch_layers
 
     os.makedirs(output_dir, exist_ok=True)
 
-    logger.info("Clearing CUDA cache before starting (normal capture).")
+    logger.info("Clearing CUDA cache before starting (typo patch).")
     torch.cuda.empty_cache()
+
+    # Set the model's config to output attentions
+    model.config.output_attentions = True
 
     if generation_kwargs is None:
         generation_kwargs = DEFAULT_GENERATION_KWARGS
 
+    # We'll use a set for quick lookup of which layers to patch.
+    attention_patch_layers = set(patch_layers)
+
     total_samples = len(data)
     total_batches = math.ceil(total_samples / batch_size)
-    logger.warning(f"=== Starting NORMAL inference/capture. #samples={total_samples}, batch_size={batch_size} ===")
+    logger.warning(f"=== Starting MAIN (typo) inference with patched attention. #samples={total_samples} ===")
 
+    # Process samples one by one to allow per-sample patching.
+    results = []
     for batch_idx in range(total_batches):
         start_i = batch_idx * batch_size
         end_i = min((batch_idx + 1) * batch_size, total_samples)
@@ -63,7 +115,7 @@ def run_inf_normal_capture(model,
         batch_texts = [x[1] for x in batch_items]
 
         if batch_idx % 20 == 0:
-            logger.info(f"[Normal Capture] Processing batch {batch_idx+1}/{total_batches} (samples {start_i}-{end_i-1})")
+            logger.info(f"[Typo Patch] Processing batch {batch_idx+1}/{total_batches} (samples {start_i}-{end_i-1})")
 
         encodings = tokenizer(
             batch_texts,
@@ -75,62 +127,86 @@ def run_inf_normal_capture(model,
         input_ids = encodings["input_ids"].cuda()
         attention_mask = encodings["attention_mask"].cuda()
 
-        try:
-            with torch.no_grad():
-                outputs = model(
+        # For simplicity, we perform a single-sample forward pass for each sample in the batch.
+        for i, sample_idx in enumerate(batch_indices):
+            single_input_ids = input_ids[i].unsqueeze(0)
+            single_attn_mask = attention_mask[i].unsqueeze(0)
+
+            # Define a patched forward for a single sample.
+            original_forward_inner = model.forward
+            def single_sample_patched_forward(input_ids=None, attention_mask=None, **kwargs):
+                raw_outputs = original_forward_inner(
                     input_ids=input_ids,
                     attention_mask=attention_mask,
-                    output_attentions=True  # only attention needed
+                    **kwargs
+                )
+                new_attns = []
+                # Use the saved normal attention if available for this sample.
+                if sample_idx in normal_attn_map_all:
+                    normal_sample_map = normal_attn_map_all[sample_idx]  # dict: layer_key -> tensor
+                else:
+                    normal_sample_map = {}
+                for layer_idx, attn_tensor in enumerate(raw_outputs.attentions):
+                    # attn_tensor shape: [1, num_heads, seq_len, seq_len]
+                    if layer_idx in attention_patch_layers:
+                        layer_key = f"layer_{layer_idx}"
+                        if layer_key in normal_sample_map:
+                            normal_attn = normal_sample_map[layer_key].to(attn_tensor.device)
+                            patched_layer = patch_attention(attn_tensor, normal_attn, scale=patch_scale)
+                            new_attns.append(patched_layer)
+                        else:
+                            new_attns.append(attn_tensor)
+                    else:
+                        new_attns.append(attn_tensor)
+                # Reconstruct the output with patched attentions.
+                final_output = raw_outputs.__class__(
+                    loss=raw_outputs.loss,
+                    logits=raw_outputs.logits,
+                    past_key_values=raw_outputs.past_key_values,
+                    hidden_states=raw_outputs.hidden_states,
+                    attentions=tuple(new_attns),
+                )
+                return final_output
+
+            model.forward = single_sample_patched_forward
+            with torch.no_grad():
+                outputs = model(
+                    input_ids=single_input_ids,
+                    attention_mask=single_attn_mask
                 )
                 gen_out = model.generate(
-                    input_ids,
-                    attention_mask=attention_mask,
+                    single_input_ids,
+                    attention_mask=single_attn_mask,
                     pad_token_id=tokenizer.pad_token_id,
                     eos_token_id=tokenizer.eos_token_id,
                     **generation_kwargs
                 )
+            # Restore original forward.
+            model.forward = original_forward_inner
 
-            # Save attention maps from ALL layers specified in extract_attention_layers
-            attn_map = {}
-            for layer_idx in extract_attention_layers:
-                if layer_idx < len(outputs.attentions):
-                    # Each tensor shape: [batch_size, num_heads, seq_len, seq_len]
-                    attn_map[f"layer_{layer_idx}"] = outputs.attentions[layer_idx].cpu()
+            decoded_pred = tokenizer.decode(gen_out[0].cpu(), skip_special_tokens=True)
+            results.append({
+                "sample_idx": sample_idx,
+                "final_prediction": decoded_pred,
+                "attentions": [a.cpu() for a in outputs.attentions],
+            })
 
-            logits = outputs.logits
-            topk_vals, topk_indices = torch.topk(logits, k=top_k_logits, dim=-1)
-            topk_vals = topk_vals.cpu()
-            topk_indices = topk_indices.cpu()
-
-            decoded_preds = [
-                tokenizer.decode(o, skip_special_tokens=True) for o in gen_out.cpu()
-            ]
-
-            out_dict = {
-                "attentions": attn_map,
-                "topk_vals": topk_vals,
-                "topk_indices": topk_indices,
-                "input_ids": input_ids.cpu(),
-                "final_predictions": decoded_preds,
-                "original_indices": batch_indices
-            }
-
-            save_name = f"normal_attn_batch_{start_i:05d}_{end_i:05d}.pt"
-            save_path = os.path.join(output_dir, save_name)
-            torch.save(out_dict, save_path)
-            logger.debug(f"[Normal Capture] Saved batch => {save_path}")
-
-        except torch.cuda.OutOfMemoryError:
-            logger.error(f"OOM error on batch {batch_idx}. Clearing cache and continuing.")
-            torch.cuda.empty_cache()
-        except Exception as ex:
-            logger.exception(f"Error on batch {batch_idx}: {ex}")
-
-    logger.warning("=== Normal Inference Capture Complete ===")
+    # Save all results in one file per batch (or adjust as needed)
+    save_name = "patched_main_results.pt"
+    save_path = os.path.join(output_dir, save_name)
+    torch.save(results, save_path)
+    logger.debug(f"[Typo Patch] Saved patched results => {save_path}")
+    logger.warning("=== Main (typo) patched Inference Complete ===")
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Run inference on NORMAL data and capture full attention maps.")
+    parser = argparse.ArgumentParser(description="Run inference on MAIN typos with patched attention from normal.")
+    parser.add_argument("--normal_attention_dir", type=str, required=True,
+                        help="Directory containing the .pt files from the normal run.")
+    parser.add_argument("--patch_scale", type=float, default=1.0,
+                        help="How much to replace attention with normal? 1.0 = full replacement, 0.5 = blend, etc.")
+    parser.add_argument("--patch_layers", type=str, default="all",
+                        help="Comma-separated list of layers to patch, or 'all' to patch every layer.")
     parser.add_argument("--output_dir", type=str, default=DEFAULT_OUTPUT_DIR)
     parser.add_argument("--batch_size", type=int, default=DEFAULT_BATCH_SIZE)
     parser.add_argument("--max_seq_length", type=int, default=DEFAULT_MAX_SEQ_LENGTH)
@@ -139,16 +215,29 @@ if __name__ == "__main__":
 
     logging.basicConfig(level=logging.INFO)
     logger = logging.getLogger("polAIlogger")
-    
-    # EXAMPLE: dummy data
-    dummy_data = [(i, f"Solve this task: 4 + 93 = ??? [Normal version {i}]") for i in range(10)]
+
+    # Process patch_layers argument.
+    if args.patch_layers.lower() == "all":
+        patch_layers = list(range(DEFAULT_NUM_LAYERS))
+    else:
+        # Parse comma-separated list into integers.
+        patch_layers = [int(x.strip()) for x in args.patch_layers.split(",")]
+
+    # EXAMPLE: dummy data (typo version)
+    dummy_data = [(i, f"Solve this tasck: 4 + 93 = ??? [Typo version {i}]") for i in range(10)]
 
     model, tokenizer = load_model(logger=logger)
+    
+    # Load the normal attention from Script A.
+    normal_attn_map_all = load_normal_attention(args.normal_attention_dir, logger=logger)
 
-    run_inf_normal_capture(
+    run_inf_main_patched(
         model=model,
         tokenizer=tokenizer,
         data=dummy_data,
+        normal_attn_map_all=normal_attn_map_all,
+        patch_scale=args.patch_scale,
+        patch_layers=patch_layers,
         output_dir=args.output_dir,
         batch_size=args.batch_size,
         max_seq_length=args.max_seq_length,
