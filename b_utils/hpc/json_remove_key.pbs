@@ -1,0 +1,25 @@
+#!/bin/bash
+#PBS -N xs_pure1k_extraction_inf
+#PBS -l select=1:ncpus=8:ngpus=1:mem=8gb
+#PBS -l walltime=10:00:00
+#PBS -o logs/xs_pure1k_extraction_inf.out
+#PBS -e logs/xs_pure1k_extraction_inf.err
+
+# Move to the directory from which job submitted
+cd $PBS_O_WORKDIR
+
+echo "$(date "+%Y-%m-%d %H:%M:%S") - xs_pure1k_extraction_inf started" >> $HOME/times.log
+nvidia-smi --query-gpu=name --format=csv,noheader
+
+
+# Paths
+CONTAINER_PATH="$PBS_O_WORKDIR/containers/hf_cont.sif"
+SCRIPT_PATH="$PBS_O_WORKDIR/scripts/inference/extraction_inf.py"
+
+# Run the script inside the container
+singularity exec --nv \
+    -B "$HOME/polAItness_internals:/workspace" \
+    "$CONTAINER_PATH" \
+    python "$SCRIPT_PATH" --tensor-parallel
+
+echo "$(date "+%Y-%m-%d %H:%M:%S") - xs_pure1k_extraction_inf finished" >> $HOME/times.log
