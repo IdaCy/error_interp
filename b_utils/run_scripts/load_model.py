@@ -39,7 +39,8 @@ def load_model(model_name=DEFAULT_MODEL_NAME,
         device_map="auto",
         low_cpu_mem_usage=True,
         max_memory=max_memory,
-        use_auth_token=hf_token
+        use_auth_token=hf_token,
+        trust_remote_code=True
     )
     model.eval()
     logger.info("Model loaded successfully.")
